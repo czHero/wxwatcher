@@ -1,0 +1,21 @@
+# wechat-monitor 用户级 systemd 单元（只读轮询，groupwatch 的摄入源）。
+# 安装：见 deploy/DEPLOY.md；目标目录 ~/.config/systemd/user/。
+# 依赖图形会话是硬性前提：解密读库与产物链路都跑在登录后的用户环境里。
+# 精确语义：loginctl enable-linger 让 user 服务管理器开机即活（enabled 单元已装载），
+# 但本单元 BindsTo graphical-session——实际拉起在**登录且图形会话就绪之后**，
+# 不是登录前的裸开机自启；无人值守重启即恢复需 GDM 自动登录（见 DEPLOY.md 第 7 步）。
+
+[Unit]
+Description=wechat-monitor 微信群消息只读轮询（groupwatch 摄入源）
+After=graphical-session.target
+BindsTo=graphical-session.target
+
+[Service]
+ExecStart=/home/dgkj/.pyenv/versions/3.13.12/bin/python3 /home/dgkj/文档/wechat2/tools/wechat-monitor/monitor.py --interval 30
+WorkingDirectory=/home/dgkj/文档/wechat2
+# monitor 本身不读 GROUPWATCH_HOME；与 groupwatchd 钉同一行，两单元模板一致（README 前提 8）。
+Environment=GROUPWATCH_HOME=%h/.groupwatch
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

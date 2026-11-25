@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+WeChatMac_4.2.0.dmg
+.superpowers/

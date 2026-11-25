@@ -1,0 +1,29 @@
+{
+  "screen": [1440, 900],
+  "steps": {
+    "focus": [["/usr/bin/true"]],
+    "open_search": [
+      ["sudo", "ydotool", "mousemove", "--", "-5000", "-5000"],
+      ["sudo", "ydotool", "mousemove", "190", "{IDENT}"],
+      ["sudo", "ydotool", "click", "1"]
+    ],
+    "paste": [
+      ["sh", "-c", "wl-copy \"$1\" >/dev/null 2>&1", "_", "{TEXT}"],
+      ["sudo", "ydotool", "key", "ctrl+v"]
+    ],
+    "select_first": [
+      ["sudo", "ydotool", "mousemove", "--", "-5000", "-5000"],
+      ["sudo", "ydotool", "mousemove", "600", "805"],
+      ["sudo", "ydotool", "click", "1"],
+      ["sudo", "ydotool", "key", "--repeat", "200", "backspace"]
+    ],
+    "send": [
+      ["sudo", "ydotool", "mousemove", "--", "-5000", "-5000"],
+      ["sudo", "ydotool", "mousemove", "1391", "866"],
+      ["sudo", "ydotool", "click", "1"],
+      ["sudo", "ydotool", "mousemove", "--", "-5000", "-5000"],
+      ["sudo", "ydotool", "mousemove", "190", "{IDENT}"],
+      ["sudo", "ydotool", "click", "1"]
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+# groupwatchd 用户级 systemd 单元（审计推送守护）。
+# 安装：见 deploy/DEPLOY.md；目标目录 ~/.config/systemd/user/。
+# Requires+After 钉住 wechat-monitor.service：摄入源先活着，本守护才有 JSONL 可摄取；
+# monitor 单元停止会连带停止本单元（Requires 语义），杜绝半瘫运行。
+# BindsTo 图形会话——gnome-screenshot/wxsend 需要登录后的 Wayland 会话，
+# 会话结束即停，不留下发不出消息的僵尸轮次。
+
+[Unit]
+Description=groupwatchd 群消息审计与推送守护（监听→判定→提取→推送）
+After=graphical-session.target wechat-monitor.service
+Requires=wechat-monitor.service
+BindsTo=graphical-session.target
+
+[Service]
+ExecStart=/home/dgkj/.pyenv/versions/3.13.12/bin/python3 /home/dgkj/文档/wechat2/tools/groupwatch/groupwatch.py run
+WorkingDirectory=/home/dgkj/文档/wechat2
+Environment=GROUPWATCH_HOME=%h/.groupwatch
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

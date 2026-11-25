@@ -1,0 +1,6 @@
+{
+  "targets": {
+    "filehelper": {"kind": "user", "ident": "文件传输助手", "wxid": "filehelper", "row": 141},
+    "team": {"kind": "group", "ident": "123@chatroom", "row": 220}
+  }
+}
