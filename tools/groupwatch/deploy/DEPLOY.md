@@ -30,6 +30,9 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'no
 ```
 
 微信侧人工准备：窗口最大化、前台、不遮挡（`enroll` 的预检点位按全屏标定）；
+运营前提：汇总/实时推送时刻，微信须是最前置全屏窗口（预检采左栏图标特征色，
+深色平面窗口会被识破；聊天钮点位隐含微信停在聊天 tab 的约定——换 tab 会被
+识破为 pre_fail：零执行、status 可见、恢复后自动重试，无静默风险）。
 收件人（默认文件传输助手）在会话列表置顶。wxsend 的两项系统前提须已就绪：
 sudo 免密 ydotool（NOPASSWD）、拼音输入法已关闭（拼音吞键，见
 `tools/wechat-send/README.md` 运行前提第 4/5 条）。
@@ -96,7 +99,10 @@ nohup /home/dgkj/.pyenv/versions/3.13.12/bin/python3 /home/dgkj/文档/wechat2/t
 $GW enroll
 ```
 
-内部走 `gnome-screenshot` 截屏 + 四个点位像素采样，写 `probe_points.json`。
+内部走 `gnome-screenshot` 截屏 + 六个不变量点位（标题带/侧栏 + 左图标栏
+聊天钮/通讯录钮/收藏钮/下栏钮）像素采样，写 `probe_points.json`（F3 起不再
+采样聊天区相关点位——微信停在非聊天页也应通过预检；F3-round3 起补入左栏
+图标点位——纯深色平面遮挡不再能穿透；旧基线需重跑本步刷新）。
 交互终端会先确认「微信在前台且无遮挡」再截图；非 tty 环境（如脚本里跑）
 加 `--yes`。桌面布局/分辨率变化后重跑本步。
 

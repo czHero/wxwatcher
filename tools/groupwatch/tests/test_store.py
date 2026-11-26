@@ -131,6 +131,131 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(self.store.try_fire_digest("2026-11-24", "20:30"))
         self.store.digest_unfire("1999-01-01", "00:00")
 
+    # ---- digest_pending（F2 持久补发队列）----
+
+    def _digest_fired_pairs(self):
+        rows = self.store._conn.execute(
+            "SELECT day, hhmm FROM digest_fired ORDER BY day, hhmm").fetchall()
+        return [(r["day"], r["hhmm"]) for r in rows]
+
+    def test_digest_pending_enqueue_idempotent_and_oldest(self):
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        self.assertIsNone(self.store.oldest_digest_pending())
+        self.assertTrue(self.store.enqueue_digest("2026-11-25", "20:30",
+                                                  "汇总A", 100))
+        # PK 撞已排队：False，且不覆盖原文本
+        self.assertFalse(self.store.enqueue_digest("2026-11-25", "20:30",
+                                                   "汇总A改", 999))
+        self.assertEqual(self.store.oldest_digest_pending()["text"], "汇总A")
+        self.assertTrue(self.store.enqueue_digest("2026-11-25", "21:00",
+                                                  "汇总B", 100))
+        self.assertEqual(self.store.pending_digest_count(), 2)
+        # 队首 = created_ts 最早（入队序）；同 ts（同 tick 齐排）按 day, hhmm
+        # 升序破平 → 20:30 先于 21:00
+        self.assertTrue(self.store.enqueue_digest("2026-11-26", "08:00",
+                                                  "次日早班", 150))
+        oldest = self.store.oldest_digest_pending()
+        # F2-round2 后队首行携带 state（新槽位默认 'pending'）
+        self.assertEqual(set(oldest), {"day", "hhmm", "text", "created_ts",
+                                       "state"})
+        self.assertEqual(oldest["state"], "pending")
+        self.assertEqual((oldest["day"], oldest["hhmm"], oldest["text"],
+                          oldest["created_ts"]),
+                         ("2026-11-25", "20:30", "汇总A", 100))
+        self.store.resolve_digest("2026-11-25", "20:30")
+        self.assertEqual(self.store.pending_digest_count(), 2)
+        self.assertEqual(self.store.oldest_digest_pending()["hhmm"], "21:00")
+        # 前一日槽位补完 → 次日队首
+        self.store.resolve_digest("2026-11-25", "21:00")
+        self.assertEqual(self.store.oldest_digest_pending()["day"],
+                         "2026-11-26")
+
+    def test_digest_resolve_finalizes_and_has_record(self):
+        # resolve = 出队 + 定稿（digest_fired 加行）；has_digest_record 覆盖
+        # 两表——已排队或已定稿都算"已处理"（enqueue 守卫，防重排/重发）。
+        self.assertFalse(self.store.has_digest_record("2026-11-25", "20:30"))
+        self.store.enqueue_digest("2026-11-25", "20:30", "汇总", 100)
+        self.assertTrue(self.store.has_digest_record("2026-11-25", "20:30"))
+        self.assertEqual(self._digest_fired_pairs(), [])  # 排队 ≠ 已发
+        self.store.resolve_digest("2026-11-25", "20:30")
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        self.assertEqual(self._digest_fired_pairs(),
+                         [("2026-11-25", "20:30")])
+        self.assertTrue(self.store.has_digest_record("2026-11-25", "20:30"))
+        # 定稿幂等：再 resolve 一次不产生第二行（PK + INSERT OR IGNORE）
+        self.store.resolve_digest("2026-11-25", "20:30")
+        self.assertEqual(self._digest_fired_pairs(),
+                         [("2026-11-25", "20:30")])
+
+    def test_has_digest_record_covers_both_tables(self):
+        # 只在 fired（历史定稿）→ True；只在 pending（在队）→ True；皆无 → False
+        self.store.try_fire_digest("2026-11-24", "08:00")
+        self.assertTrue(self.store.has_digest_record("2026-11-24", "08:00"))
+        self.store.enqueue_digest("2026-11-24", "09:00", "t", 1)
+        self.assertTrue(self.store.has_digest_record("2026-11-24", "09:00"))
+        self.assertFalse(self.store.has_digest_record("2026-11-24", "10:00"))
+        self.assertEqual(self.store.pending_digest_count(), 1)
+
+    # ---- digest_pending 状态机（F2-round2：歧义结局 held 永不自动重发）----
+
+    def test_hold_digest_excludes_from_fifo_and_surfaces_held(self):
+        self.assertEqual(self.store.held_digest_count(), 0)
+        self.assertEqual(self.store.held_digests(), [])
+        self.store.enqueue_digest("2026-11-25", "20:30", "A", 100)
+        self.store.enqueue_digest("2026-11-25", "21:00", "B", 110)
+        self.store.hold_digest("2026-11-25", "20:30")
+        # held 被 FIFO 排除；待补发计数只数 state='pending'
+        self.assertEqual(self.store.oldest_digest_pending()["hhmm"], "21:00")
+        self.assertEqual(self.store.pending_digest_count(), 1)
+        self.assertEqual(self.store.held_digest_count(), 1)
+        held = self.store.held_digests()
+        self.assertEqual([(h["day"], h["hhmm"], h["state"]) for h in held],
+                         [("2026-11-25", "20:30", "held")])
+        # held 行仍是"已处理"记录：不会被重新渲染入队（has_record 覆盖任意态）
+        self.assertTrue(self.store.has_digest_record("2026-11-25", "20:30"))
+        self.assertFalse(self.store.enqueue_digest("2026-11-25", "20:30",
+                                                   "A2", 200))
+        self.assertEqual(self.store.held_digests()[0]["text"], "A")  # 不覆盖
+
+    def test_resolve_finalizes_held_row_too(self):
+        # 人工裁决"确认已送达"= resolve 语义：held 行同样删除 + 进 digest_fired。
+        self.store.enqueue_digest("2026-11-25", "09:12", "歧义条", 100)
+        self.store.hold_digest("2026-11-25", "09:12")
+        self.store.resolve_digest("2026-11-25", "09:12")
+        self.assertEqual(self.store.held_digest_count(), 0)
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        self.assertEqual(self._digest_fired_pairs(), [("2026-11-25", "09:12")])
+
+    def test_open_store_alters_pre_round2_schema(self):
+        # 实况库（2026-11-26 事故机）建表于 round-1：digest_pending 无 state
+        # 列。open_store 必须 ALTER 补列，旧行按 DEFAULT 落到 'pending'
+        # （恢复可重试，无 held 语义），既有行/主键守卫原样保留，重复打开幂等。
+        legacy = self.path.parent / "legacy-round1.db"
+        conn = sqlite3.connect(legacy)
+        conn.execute("CREATE TABLE digest_pending ("
+                     "day TEXT, hhmm TEXT, text TEXT, created_ts INTEGER, "
+                     "PRIMARY KEY (day, hhmm))")
+        conn.execute("INSERT INTO digest_pending VALUES"
+                     "('2026-11-25','20:30','旧行',100)")
+        conn.commit()
+        conn.close()
+        st2 = store.open_store(legacy)
+        self.addCleanup(st2._conn.close)
+        cols = {r[1] for r in st2._conn.execute(
+            "PRAGMA table_info(digest_pending)")}
+        self.assertIn("state", cols)
+        job = st2.oldest_digest_pending()
+        self.assertEqual((job["text"], job["state"]), ("旧行", "pending"))
+        self.assertEqual(st2.pending_digest_count(), 1)
+        self.assertEqual(st2.held_digest_count(), 0)
+        self.assertFalse(st2.enqueue_digest("2026-11-25", "20:30", "新", 200))
+        st2.hold_digest("2026-11-25", "20:30")
+        self.assertIsNone(st2.oldest_digest_pending())
+        # 再次打开：迁移幂等，不报错不重跑
+        st3 = store.open_store(legacy)
+        self.addCleanup(st3._conn.close)
+        self.assertEqual(st3.held_digest_count(), 1)
+
     # ---- dispatches / audit_log ----
 
     def test_log_dispatch_and_recent_dispatches(self):
@@ -152,6 +277,23 @@ class StoreTest(unittest.TestCase):
                             "FROM audit_log").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1:], ("a@chatroom", 5, 2, "ok"))
+
+    def test_last_dispatch_filters_by_kind(self):
+        # F1：跨类型去重遮蔽的根修——按 kind 取最新一笔，别的 kind 更新的行
+        # 不得遮蔽（20:30 digest pre_fail 曾被 realtime 行的"最新一笔"吞掉）。
+        self.assertIsNone(self.store.last_dispatch("digest"))  # 空表
+        self.store.log_dispatch("digest", "pre_fail", "d1")
+        self.store.log_dispatch("realtime", "pre_fail", "r1")
+        self.store.log_dispatch("digest", "ok", "d2")
+        self.store.log_dispatch("realtime", "ok", "r2")
+        last = self.store.last_dispatch("digest")
+        self.assertIsInstance(last, dict)
+        self.assertEqual((last["kind"], last["status"], last["detail"]),
+                         ("digest", "ok", "d2"))  # 同 kind 内最新在前，r2 不遮蔽
+        last = self.store.last_dispatch("realtime")
+        self.assertEqual((last["kind"], last["status"], last["detail"]),
+                         ("realtime", "ok", "r2"))
+        self.assertIsNone(self.store.last_dispatch("nope"))  # 无此 kind → None
 
     # ---- counts ----
 

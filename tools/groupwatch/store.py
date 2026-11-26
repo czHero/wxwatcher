@@ -73,7 +73,27 @@ CREATE TABLE IF NOT EXISTS digest_fired (
     hhmm TEXT,
     PRIMARY KEY (day, hhmm)
 );
+CREATE TABLE IF NOT EXISTS digest_pending (
+    day TEXT,
+    hhmm TEXT,
+    text TEXT,
+    created_ts INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY (day, hhmm)
+);
 """
+
+
+def _migrate_digest_pending_state(conn) -> None:
+    """F2-round2 迁移：round-1 建库的实况 DB（2026-11-26 事故机）里
+    digest_pending 无 state 列。CREATE TABLE IF NOT EXISTS 不会碰已存在的
+    表，故显式 ALTER 补列——SQLite 允许 NOT NULL + 常量 DEFAULT，旧行按
+    DEFAULT 落 'pending'（歧义语义尚不存在过，重试合法）。幂等：列已在即
+    跳过，重复 open_store 不报错。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(digest_pending)")}
+    if "state" not in cols:
+        conn.execute("ALTER TABLE digest_pending ADD COLUMN "
+                     "state TEXT NOT NULL DEFAULT 'pending'")
 
 
 def _source_hash(keys) -> str:
@@ -214,11 +234,88 @@ class Store:
         return cur.rowcount == 1  # 真=首次
 
     def digest_unfire(self, day: str, hhmm: str) -> None:
-        """回收一次**推送失败**的 digest 占位（终审 C1）：删行后下一 tick
-        可重试。只按 (day, hhmm) 精确删，邻位不误伤；删不中是无害 no-op。"""
+        """【已弃用·F2】旧 in-tick 重试 hack（配合 try_fire_digest）。持久
+        队列落地后 one_tick 不再走 fire/unfire；保留实现只为兼容与既有契约
+        测试，新代码请用 enqueue_digest/resolve_digest。"""
         self._conn.execute(
             "DELETE FROM digest_fired WHERE day=? AND hhmm=?", (day, hhmm))
         self._conn.commit()
+
+    # ---- digest_pending（F2：未送达汇总持久补发队列）----
+
+    def enqueue_digest(self, day: str, hhmm: str, text: str,
+                      ts: int) -> bool:
+        """排队一条待补发汇总（state 走列默认 'pending'）。INSERT OR IGNORE：
+        True=新入队；False=该槽位已在队列——含 held 行（PK 撞行，歧义待裁决
+        的原文本绝不被新一轮渲染覆盖）。已定稿槽位的防重排由调用方用
+        has_digest_record 把守。"""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO digest_pending(day, hhmm, text, created_ts) "
+            "VALUES(?, ?, ?, ?)", (day, hhmm, text, ts))
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def oldest_digest_pending(self) -> dict | None:
+        """队首（最早入队、state='pending'）待补发项，键含 day/hhmm/text/
+        created_ts/state；无可发项 None。**held 行被排除**——歧义结局
+        （needs_check/gui_partial/crash）永不自动重发（F2-round2 核心协议），
+        只有人工裁决改回 pending 才重新入 FIFO。created_ts 相同（同 tick 多
+        槽位齐补）按 day, hhmm 升序破平——先过期的先发。"""
+        row = self._conn.execute(
+            "SELECT * FROM digest_pending WHERE state='pending' "
+            "ORDER BY created_ts, day, hhmm LIMIT 1").fetchone()
+        return dict(row) if row is not None else None
+
+    def hold_digest(self, day: str, hhmm: str) -> None:
+        """歧义结局（推送返回 needs_check / gui_partial / crash——发送可能
+        已执行、状态未知）→ state='held'：留在 digest_pending 供 status
+        可见与人工裁决，但被 oldest_digest_pending 排除，自动重发不可达。
+        行不存在是无害 no-op。"""
+        self._conn.execute(
+            "UPDATE digest_pending SET state='held' WHERE day=? AND hhmm=?",
+            (day, hhmm))
+        self._conn.commit()
+
+    def held_digest_count(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM digest_pending "
+            "WHERE state='held'").fetchone()["n"]
+
+    def held_digests(self) -> list[dict]:
+        """全部待人工裁决行（status 展示用），created_ts/day/hhmm 升序——
+        首元素即最旧待裁决槽位。"""
+        rows = self._conn.execute(
+            "SELECT * FROM digest_pending WHERE state='held' "
+            "ORDER BY created_ts, day, hhmm").fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_digest(self, day: str, hhmm: str) -> None:
+        """槽位定稿（仅在推送 "ok" 后调用）：从 digest_pending 删行（任意
+        state，held 行亦然——即人工裁决"确认已送达"的等价操作）+ INSERT OR
+        IGNORE 进 digest_fired。两步各自幂等，重复调用无害。"""
+        self._conn.execute(
+            "DELETE FROM digest_pending WHERE day=? AND hhmm=?", (day, hhmm))
+        self._conn.execute(
+            "INSERT OR IGNORE INTO digest_fired(day, hhmm) VALUES(?, ?)",
+            (day, hhmm))
+        self._conn.commit()
+
+    def has_digest_record(self, day: str, hhmm: str) -> bool:
+        """该槽位是否"已处理"：在队列（任意 state，pending/held 皆算）**或**
+        已定稿（digest_fired）——enqueue 侧的幂等守卫，防止已排队（含歧义
+        待裁决）、已发槽位被重新渲染再排一遍。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM digest_pending WHERE day=? AND hhmm=? "
+            "UNION ALL SELECT 1 FROM digest_fired WHERE day=? AND hhmm=?",
+            (day, hhmm, day, hhmm)).fetchone()
+        return row is not None
+
+    def pending_digest_count(self) -> int:
+        """待补发条数（state='pending'）。held 行不计——它们有专列计数
+        held_digest_count()，status 两路分开显示。"""
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM digest_pending "
+            "WHERE state='pending'").fetchone()["n"]
 
     # ---- dispatches / audit_log ----
 
@@ -239,6 +336,15 @@ class Store:
         rows = self._conn.execute(
             "SELECT * FROM dispatches ORDER BY id DESC LIMIT ?", (n,)).fetchall()
         return [dict(r) for r in rows]
+
+    def last_dispatch(self, kind: str) -> dict | None:
+        """该 kind 的最新一笔 dispatch（无则 None）。F1：pre_fail 去重的
+        比较对象——跨 kind 的"全局最新一笔"会遮蔽被挡 digest 的首笔
+        （2026-11-26 实况：20:30 digest 的 pre_fail 整晚零痕迹）。"""
+        row = self._conn.execute(
+            "SELECT * FROM dispatches WHERE kind=? ORDER BY id DESC LIMIT 1",
+            (kind,)).fetchone()
+        return dict(row) if row is not None else None
 
     # ---- 聚合 / 清理 ----
 
@@ -272,5 +378,6 @@ def open_store(path: Path) -> Store:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
+    _migrate_digest_pending_state(conn)  # F2-round2：旧库补 state 列（幂等）
     conn.commit()
     return Store(conn)

@@ -241,6 +241,43 @@ class CliTest(unittest.TestCase):
         # recent_dispatches 展示
         self.assertIn("needs_check", out)
 
+    def test_status_surfaces_pending_digest_queue(self):
+        # F2：存在未送达汇总必须肉眼可见——status 露 pending_digest_count，
+        # 且 >0 时点名最旧待补发槽位（day/hhmm）。
+        _seed_valid_config(self.home)
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("未送达汇总 0", out)
+        self.assertIn("待人工裁决汇总 0", out)
+        self.assertNotIn("最旧待补发", out)
+        self.assertNotIn("待裁决:", out)
+        st = store.open_store(self.home / "groupwatch.db")
+        self.addCleanup(st._conn.close)
+        st.enqueue_digest("2026-11-25", "20:30", "二十五日的汇总", 100)
+        st.enqueue_digest("2026-11-25", "21:00", "二十五日二班", 120)
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("未送达汇总 2", out)
+        self.assertIn("最旧待补发: 2026-11-25 20:30", out)
+
+    def test_status_surfaces_held_digests(self):
+        # F2-round2：needs_check 类歧义结局被 hold——status 必须数出 held 笔数、
+        # 点名最旧待裁决槽位，并把人工指引指向 README 的两条裁决 SQL。
+        _seed_valid_config(self.home)
+        st = store.open_store(self.home / "groupwatch.db")
+        self.addCleanup(st._conn.close)
+        st.enqueue_digest("2026-11-25", "20:30", "在队一条", 100)
+        st.enqueue_digest("2026-11-26", "09:12", "歧义一条", 200)
+        st.enqueue_digest("2026-11-26", "09:13", "又歧义一条", 300)
+        st.hold_digest("2026-11-26", "09:12")
+        st.hold_digest("2026-11-26", "09:13")
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("未送达汇总 1", out)  # pending 计数不含 held
+        self.assertIn("待人工裁决汇总 2", out)
+        self.assertIn("待裁决: 2026-11-26 09:12", out)  # 最旧 held 点名
+        self.assertIn("README", out)  # 指向裁决 SQL 文档
+
     def test_status_reports_config_error_exit0(self):
         # 无 config.json → load_config 抛 ConfigError，status 只报不崩，退出码 0
         code, out = _run(["status"], self.home)

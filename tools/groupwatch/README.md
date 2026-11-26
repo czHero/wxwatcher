@@ -96,7 +96,7 @@ export GW="/home/dgkj/.pyenv/versions/3.13.12/bin/python3 /home/dgkj/文档/wech
 | `$GW init` | 建立 `~/.groupwatch/`（0700）带占位符的运行环境；拒绝覆盖已存在文件 |
 | `$GW test-model judge` / `… extract` | 链路探针：真实配置 + 真实网络各发一条 |
 | `$GW groups` | 列出全部群 `[订阅|未订阅] 群名 — id`，供编辑 groups.json |
-| `$GW status` | 计数/游标/jsonl 新鲜度/推送流水/待推明细（只报告，不修复） |
+| `$GW status` | 计数/游标/jsonl 新鲜度/推送流水/待推明细/汇总队列（待补发+待裁决）（只报告，不修复） |
 | `$GW once` | 单轮 tick（`--dry-run` 不外发不联网） |
 | `$GW run` | 常驻主循环（Ctrl-C 退出；生产用 systemd 单元） |
 | `$GW enroll` | 截图采样写 probe_points.json（发送前预检基线） |
@@ -107,7 +107,11 @@ CLI 退出码只有两种：**0 成功/信息性报告，2 一切错误**（用�
 ## 推送状态与退出码表（本守护的处置，设计 §5.5）
 
 每批推送开头过一次只读预检门（`probe_points.json` 像素断言），不过则**一条 GUI
-命令都不发**、整队留在 pending，条件恢复后自动续流。wxsend 退出码的处置：
+命令都不发**、整队留在 pending，条件恢复后自动续流。运营前提：汇总/实时推送
+时刻，微信须是最前置全屏窗口——预检采左栏图标特征色（F3-round3 实况 A/B：
+纯 chrome 点位会被深色平面窗口巧合穿透），平面遮挡会被识破；聊天钮点位另
+隐含微信停在聊天 tab 的约定（换 tab → pre_fail，零执行、可见、恢复后自动
+重试）。wxsend 退出码的处置：
 
 | wxsend 退出码 | 含义 | 本系统状态 | 自动重发？ |
 |---|---|---|---|
@@ -123,6 +127,36 @@ CLI 退出码只有两种：**0 成功/信息性报告，2 一切错误**（用�
 > 状态名（代码内状态名 hold，即挂起禁重发）；搁置条目永不出现在任何自动重发
 > 路径上；人工核对后可在 `home/out/realtime-<id>.txt` 找到渲染文本（文件按
 > 情报行 id 身份命名）自行处置。
+
+### 汇总（digest）推送的结果分级
+
+每日汇总走同一条安全协议的队列版（旧"失败退位重试"措辞废除——歧义态绝不
+自动重发）：到点且当日有情报的槽位先把渲染文本入 `digest_pending` 队列，
+每 tick 至多补发队首一条，交付结果分级：
+
+| push 返回 | 含义 | 队列处置 | 自动重发？ |
+|---|---|---|---|
+| `ok` | 送达，回执确认 | 定稿：出队 + 写 `digest_fired` | —（不再发） |
+| `pre_fail` | 预检门挡住，wxsend 一条命令都没跑 | 留 `pending`，下 tick 续试（跨午夜不丢） | 是（零执行，安全） |
+| `stopped:lock_busy` | 锁忙让路，未触 GUI | 留 `pending`，下 tick 续试 | 是（零执行，安全） |
+| `stopped:needs_check` | GUI 已执行、送达状态未知（rc 3） | **`held`** 待人工裁决 | **绝不**——去手机核对 |
+| `stopped:gui_partial` | GUI 部分执行（rc 2 aborted at step） | **`held`** 待人工裁决 | **绝不** |
+| `stopped:crash` | 子进程异常——保守归入歧义（可能死在粘贴之后） | **`held`** 待人工裁决 | **绝不** |
+
+`$GW status` 分两路显示：`未送达汇总 N 条`（pending，会自动续补）与
+`待人工裁决汇总 M 条`（held，永不自动重发）。held 行保留渲染文本，按手机
+核对结果二选一裁决（把 `D`/`H` 换成 status 点名的 day/hhmm）：
+
+```bash
+# ① 确认**已送达**：定稿——删队列行 + 记 digest_fired（与 ok 后代码走的同一路）
+sqlite3 ~/.groupwatch/groupwatch.db \
+  "DELETE FROM digest_pending WHERE day='D' AND hhmm='H'; \
+   INSERT OR IGNORE INTO digest_fired(day,hhmm) VALUES('D','H');"
+
+# ② 确认**没送达**且环境已修：重入队列，下个健康 tick 自动补发
+sqlite3 ~/.groupwatch/groupwatch.db \
+  "UPDATE digest_pending SET state='pending' WHERE day='D' AND hhmm='H';"
+```
 
 ## 日常运维
 

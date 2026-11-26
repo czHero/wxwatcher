@@ -468,6 +468,49 @@ class TestPushTexts(DispatchCase):
                          [("digest", "ok")])
 
 
+class TestPerKindPreFailDedup(DispatchCase):
+    """F1（实况教训 2026-11-26）：_pre_fail 曾对 recent_dispatches(1) 去重
+    ——不看 kind。09:49 测试留下的 digest pre_fail 吞掉了 20:30 digest 的
+    第一笔 pre_fail，被挡的汇总整晚零痕迹。去重必须按 kind 隔离。"""
+
+    def _blocked(self, kind, jobs):
+        with mock.patch.object(dispatch, "load_probe_baseline",
+                               return_value=BASE), \
+             mock.patch.object(dispatch, "pixel_probe",
+                               return_value=(0, 0, 0)):
+            return dispatch.push_texts(self.cfg, self.st, jobs, kind=kind,
+                                       shot=_writing_shot, run=_fake_run())
+
+    def test_digest_pre_fail_visible_after_realtime_pre_fail(self):
+        # 最新一笔是 realtime/pre_fail 时，被挡的 digest 必须留下自己的行
+        ids = _mkintels(self.st, 1)
+        self.assertEqual(self._blocked("realtime", [(ids[0], "A")]), "pre_fail")
+        self.assertEqual(self._blocked("digest", [(None, "20:30 汇总")]),
+                         "pre_fail")
+        ds = self.st.recent_dispatches(10)
+        pre = sorted((d["kind"], d["status"]) for d in ds
+                     if d["status"] == "pre_fail")
+        self.assertEqual(pre, [("digest", "pre_fail"),
+                               ("realtime", "pre_fail")])
+
+    def test_digest_pre_fail_dedups_vs_prior_digest_pre_fail(self):
+        # 同 kind 连续被挡仍只记首笔（M5 状态语义按 kind 保留，不灌爆流水）
+        self._blocked("digest", [(None, "20:30 汇总")])
+        self._blocked("digest", [(None, "20:30 汇总")])
+        dig = [d for d in self.st.recent_dispatches(10)
+               if d["kind"] == "digest" and d["status"] == "pre_fail"]
+        self.assertEqual(len(dig), 1)
+
+    def test_cross_direction_isolation_realtime_after_digest(self):
+        # 反向同理：digest pre_fail 是最新一笔时 realtime 首笔仍可见
+        ids = _mkintels(self.st, 1)
+        self._blocked("digest", [(None, "汇总")])
+        self._blocked("realtime", [(ids[0], "A")])
+        rt = [d for d in self.st.recent_dispatches(10)
+              if d["kind"] == "realtime" and d["status"] == "pre_fail"]
+        self.assertEqual(len(rt), 1)
+
+
 class TestRequireEnrollGate(DispatchCase):
     """accept-fix 2：require_enroll=True（生产默认）时 baseline 缺失的
     "放行带警告"改判为拒绝盲发；foreground_ok 本身不动（观察归观察，
@@ -519,13 +562,108 @@ class TestRequireEnrollGate(DispatchCase):
 
 
 class TestProbePoints(DispatchCase):
-    def test_probe_points_are_calibrated_1440x900_coords(self):
+    def test_probe_points_are_six_invariant_points(self):
+        # F3-round3（实况 A/B 裁决）：2 点位 chrome 被证伪——深色平面窗口
+        # （GNOME 终端 bg≈(48,10,36)）与微信标题带/侧栏色距仅 ~27≤tol，遮挡
+        # 全过（09:26 曾把汇总投进终端窗口）。微信**左图标栏**四个图标像素
+        # 对任意平面覆盖色都强判别。点位恰为 6 个跨聊天/面板状态不变量：
+        # chrome 两点 + 左栏四钮。输入区/发送钮（聊天内容相关）依旧不得出现。
         self.assertEqual(
             dispatch.PROBE_POINTS,
             ({"name": "标题带", "x": 60, "y": 40},
              {"name": "侧栏", "x": 60, "y": 500},
-             {"name": "输入区", "x": 700, "y": 880},
-             {"name": "发送钮", "x": 1391, "y": 866}))
+             {"name": "聊天钮", "x": 95, "y": 148},
+             {"name": "通讯录钮", "x": 95, "y": 195},
+             {"name": "收藏钮", "x": 95, "y": 290},
+             {"name": "下栏钮", "x": 95, "y": 430}))
+        names = {p["name"] for p in dispatch.PROBE_POINTS}
+        self.assertNotIn("输入区", names)
+        self.assertNotIn("发送钮", names)
+        for p in dispatch.PROBE_POINTS:
+            self.assertEqual(set(p), {"name", "x", "y"})  # dict 形状不变
+
+    def test_foreground_ok_cover_window_rail_discriminates(self):
+        # F3-round3 事故回归钉：覆盖窗口帧里 chrome 两点与 baseline 完全/
+        # 容差内命中（标题带 Δ=0、侧栏 Δ≤28——正是 round-1 2 点位被证伪的
+        # 形态），四个左栏点位全是终端的平面茄色 (48,10,36) → 预检必须判假
+        # 且点名一个**左栏**点位（不是 chrome 名）。今天丢的那次真实遮挡，
+        # 从此刻起不可能静默通过。
+        rail = {"聊天钮", "通讯录钮", "收藏钮", "下栏钮"}
+        cached = {(60, 40): (48, 10, 36),    # 标题带：微信深色标题带 ≈ 覆盖色
+                  (60, 500): (48, 10, 36),   # 侧栏：同理 Δ≤28 会命中
+                  (95, 148): (1, 195, 118),  # 聊天钮 绿气泡（聊天 tab 激活）
+                  (95, 195): (224, 224, 224),
+                  (95, 290): (223, 223, 223),
+                  (95, 430): (223, 224, 224)}
+        baseline = [{"name": p["name"], "x": p["x"], "y": p["y"],
+                     "r": cached[(p["x"], p["y"])][0],
+                     "g": cached[(p["x"], p["y"])][1],
+                     "b": cached[(p["x"], p["y"])][2], "tol": 28}
+                    for p in dispatch.PROBE_POINTS]
+
+        def cover_frame(png, x, y):
+            # 覆盖态：全帧都是终端的平面茄色——chrome 巧合命中，图标全灭
+            return (48, 10, 36)
+        with mock.patch.object(dispatch, "load_probe_baseline",
+                               return_value=baseline), \
+             mock.patch.object(dispatch, "pixel_probe",
+                               side_effect=cover_frame):
+            ok, msg = dispatch.foreground_ok(self.home,
+                                             shot=_writing_shot)
+        self.assertFalse(ok)
+        named = msg.split(" ")[1]
+        self.assertIn(named, rail)  # 点名必须是左栏点——判别力正来自它们
+
+    def test_foreground_ok_chat_pane_change_does_not_block(self):
+        # F3 前提保留：baseline 由 enroll 按 PROBE_POINTS 生成。聊天区内容
+        # 变化（输入区/发送钮坐标像素漂移）不是失败源——六个采样点全命中即
+        # 放行。旧 4 点位中的内容相关坐标依旧不得进点位表（上方已钉）。
+        CONTENT_PTS = {(700, 880), (1391, 866)}
+        invariant = {(p["x"], p["y"]) for p in dispatch.PROBE_POINTS}
+        self.assertFalse(CONTENT_PTS & invariant)
+        baseline = [{"name": p["name"], "x": p["x"], "y": p["y"],
+                     "r": 100, "g": 100, "b": 100, "tol": 28}
+                    for p in dispatch.PROBE_POINTS]
+
+        def probe(png, x, y):
+            # 聊天区像素整片不同，六个不变量点完好
+            return (100, 100, 100) if (x, y) in invariant else (0, 255, 0)
+        with mock.patch.object(dispatch, "load_probe_baseline",
+                               return_value=baseline), \
+             mock.patch.object(dispatch, "pixel_probe", side_effect=probe):
+            self.assertEqual(
+                dispatch.foreground_ok(self.home, shot=_writing_shot),
+                (True, "ok"))
+
+    def test_foreground_ok_tolerance_math_6point(self):
+        # 容差判定逐点独立（6 点位）：每点边界 abs=tol 含等号通过；任一点
+        # 超一格 → 报该点名，预检不过。
+        self.assertEqual(len(dispatch.PROBE_POINTS), 6)  # 本算式钉在 6 点位上
+        baseline = [{"name": p["name"], "x": p["x"], "y": p["y"],
+                     "r": 80, "g": 80, "b": 80, "tol": 28}
+                    for p in dispatch.PROBE_POINTS]
+
+        def probe_ok(png, x, y):
+            return (80 + 28, 80 - 28, 80)  # 逐通道恰在边界 → 过
+        with mock.patch.object(dispatch, "load_probe_baseline",
+                               return_value=baseline), \
+             mock.patch.object(dispatch, "pixel_probe", side_effect=probe_ok):
+            self.assertEqual(
+                dispatch.foreground_ok(self.home, shot=_writing_shot),
+                (True, "ok"))
+
+        def probe_side_ok_bad_chrome(png, x, y):
+            if (x, y) == (60, 40):
+                return (80, 80, 80)
+            return (80 + 29, 80, 80)  # 侧栏超一格
+        with mock.patch.object(dispatch, "load_probe_baseline",
+                               return_value=baseline), \
+             mock.patch.object(dispatch, "pixel_probe",
+                               side_effect=probe_side_ok_bad_chrome):
+            ok, msg = dispatch.foreground_ok(self.home,
+                                             shot=_writing_shot)
+            self.assertFalse(ok)
+            self.assertEqual(msg, "点位 侧栏 不匹配")
 
     def test_load_probe_baseline_missing_returns_none(self):
         self.assertIsNone(dispatch.load_probe_baseline(self.home))

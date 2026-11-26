@@ -254,6 +254,22 @@ def _cmd_status(home, args) -> int:
     except OSError:
         print(f"jsonl: {j} 尚不存在（监听端还没产生消息，或路径未配好）")
 
+    # F2：未送达汇总可见——滞留队列（被挡未补发）点名最旧槽位；F2-round2：
+    # 歧义结局（needs_check 等）被 hold 的汇总单独计数点名——绝不自动重发，
+    # 人工裁决的两条 SQL 见 README"汇总推送的结果分级"段。
+    pend_n = st.pending_digest_count()
+    held_n = st.held_digest_count()
+    print(f"未送达汇总 {pend_n} 条（待补发队列）")
+    if pend_n:
+        oldest = st.oldest_digest_pending()
+        print(f"  最旧待补发: {oldest['day']} {oldest['hhmm']}")
+    print(f"待人工裁决汇总 {held_n} 条（歧义结局，绝不自动重发）")
+    if held_n:
+        oldest_held = st.held_digests()[0]
+        print(f"  待裁决: {oldest_held['day']} {oldest_held['hhmm']}"
+              f"（确认已送达/没送达的两条 SQL 见 README"
+              f"「汇总推送的结果分级」段）")
+
     disp = st.recent_dispatches(8)
     print("最近推送（至多 8 条）:")
     if not disp:

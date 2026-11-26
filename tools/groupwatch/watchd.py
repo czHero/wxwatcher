@@ -18,11 +18,16 @@
 extract_failed），游标照常推进——单批审计失败不得堵死摄取。
 
 游标超出文件实际大小说明 jsonl 被截断/轮转：回 0 重放，并在 result 里留
-`"note"`。digest 排程按"到点 且 当日有情报 且 首次 fire"三闸；当日情报为空时
-**不占 fire**（下个 tick 情报到了仍能补上当天这一班）。终审 C1 加两闸：
-本 tick realtime 推送带回非 ok → digest 整段跳过（slot 不碰）；digest 推送
-自身失败 → digest_unfire 还位重试，只有 "ok" 才真正占用 slot。M8 限流：
-digest_times 升序遍历，一 tick 至多试火一个 slot（停机恢复日不叠发多条汇总）。
+`"note"`。digest 排程（F2 持久队列）：到点且当日有情报且该槽位无记录的，
+把渲染文本落 `digest_pending`（纯 DB，"空跑不占位"由当日无情报不排队自然
+成立）；每 tick 至多补发队首一条，交付结果分级（F2-round2，与 realtime
+的 hold 协议同构）："ok" 才 `resolve_digest` 定稿（出队 + 进 digest_fired）；
+"pre_fail"/"stopped:lock_busy"（零执行已被证明）留 pending 逐 tick 续试
+（跨午夜不丢，补发当日原文）；"stopped:needs_check"/"stopped:gui_partial"/
+"stopped:crash"（GUI 可能已执行，状态未知）→ `hold_digest` 置 held——
+歧义态**永不自动重发**，FIFO 排除，人工裁决见 README。C1 闸：本 tick
+realtime 带回非 ok → 只延迟 digest **推送**，入队照常。M8 限流保留：
+一 tick 至多一次 digest 推送尝试（停机恢复日不叠发多条汇总，逐 tick 追赶）。
 
 group_names 是内存态映射（cid→群显示名）：build_deps 启动时经 contacts.py
 从 contact.db 预载真名（best-effort，失败={}），one_tick 只接受
@@ -154,36 +159,49 @@ def one_tick(deps: Deps, flush_all: bool = False) -> dict:
                 for r in rows]
             push_status = deps.push(jobs, "realtime")
 
-    # ---- digest 排程 ----
-    # C1 两道闸：
-    # ① 本 tick 的 realtime 推送一旦带回非 "ok"（pre_fail / stopped:*），
-    #    环境已证不可用，digest 整段跳过——不 try_fire（slot 从未被碰）、
-    #    不 unfire，下个 tick 再议；push_status 为 None（realtime 关闭或
-    #    本 tick 无 pending）不算触发此闸。
-    # ② digest 自身推送失败 ≠ 已发：digest_unfire 还位，让后续 tick 重试；
-    #    成功（"ok"）才保留占位。失败那笔 dispatch 流水照记（证据链）。
+    # ---- digest 排程（F2 持久队列：入队 ≠ 推送，两步解耦）----
+    # 实况教训（2026-11-26）：旧流程 to-day 槽位 + in-tick fire/unfire 让被
+    # 20:30 闸门挡下的汇总过午夜即永久丢弃。现在到点槽位的渲染文本先落
+    # digest_pending（纯 DB，不碰 GUI），推送成功（"ok"）才 resolve_digest
+    # 定稿（出队 + 进 digest_fired）；失败留在队里，之后任何健康 tick（含
+    # **跨天**之后）按 oldest-first 补发——day2 补发的仍是 day1 的文本。
+    # C1 闸门语义保留：① 本 tick realtime 带回非 ok → 只延迟**推送**，
+    # 入队照常（DB-only，不新增 GUI 触面）；② digest 推送失败 ≠ 已发。
+    # M8 保留：一 tick 至多一次 digest 推送尝试（只取队首），catch-up 逐
+    # tick 进行；"今日"按 time.localtime(now)，过期槽位从不为往日被追溯入队。
     realtime_down = push_status is not None and push_status != "ok"
-    if cfg.push.digest_enabled and not realtime_down:
+    if cfg.push.digest_enabled:
         day = time.strftime("%Y-%m-%d", time.localtime(now))
-        for hhmm in cfg.push.digest_times:
-            due = time.mktime(time.strptime(f"{day} {hhmm}", "%Y-%m-%d %H:%M"))
-            if now < due:
-                continue
-            rows = st.day_intels(day)
-            if not rows:
-                continue  # 空跑不占 fire：当日情报晚到仍能补上这一班
-            if not st.try_fire_digest(day, hhmm):
-                continue  # 今日该 slot 已推过（前次尝试且推送 ok）
-            # I4（§5.5）：累计抑制计数进汇总——counts()["suppressed"] 口径。
-            text = render_digest(day, rows, item_names, deps.group_names,
-                                 st.counts()["suppressed"])
-            if text is None:
-                continue
-            push_status = deps.push([(None, text)], "digest")
-            if push_status != "ok":
-                st.digest_unfire(day, hhmm)  # 失败退位，后续 tick 重试（C1）
-            break  # M8：一 tick 至多试火一个 slot——成功即占用；失败已退位，
-            # 环境坏时不再拿第二个 slot 连撞（catch-up 逐 tick 进行）
+        rows = st.day_intels(day)
+        if rows:
+            for hhmm in cfg.push.digest_times:
+                due = time.mktime(
+                    time.strptime(f"{day} {hhmm}", "%Y-%m-%d %H:%M"))
+                if now < due:
+                    continue  # 未到点
+                if st.has_digest_record(day, hhmm):
+                    continue  # 已排队或已定稿（空跑不占位由 rows 守卫）
+                # I4（§5.5）：累计抑制计数进汇总——counts()["suppressed"] 口径。
+                # 文本在入队时刻渲染定稿——补发时不重渲染（内容归属其当日）。
+                text = render_digest(day, rows, item_names, deps.group_names,
+                                     st.counts()["suppressed"])
+                if text is None:
+                    continue
+                st.enqueue_digest(day, hhmm, text, int(now))
+        if not realtime_down:  # 一 tick 至多一次推送尝试（队首优先）
+            job = st.oldest_digest_pending()
+            if job is not None:
+                push_status = deps.push([(None, job["text"])], "digest")
+                if push_status == "ok":
+                    st.resolve_digest(job["day"], job["hhmm"])
+                elif push_status in ("stopped:needs_check",
+                                     "stopped:gui_partial", "stopped:crash"):
+                    # F2-round2（实况 09:12/09:13 双 needs_check）：歧义结局
+                    # GUI 可能已执行——核心协议"歧义态永不自动重发"同样钉住
+                    # digest 队列：置 held，FIFO 排除，等 status+README 裁决。
+                    st.hold_digest(job["day"], job["hhmm"])
+                # pre_fail / stopped:lock_busy：零执行已被证明（预检在 wxsend
+                # 之前 / 锁忙未触 GUI）→ 留 pending，后续 tick（可跨天）续试。
 
     result = {"ingested": len(accepted), "batches": len(batches),
               "hits": hits_total, "intel_new": new_total,

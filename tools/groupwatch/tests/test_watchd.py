@@ -691,6 +691,185 @@ class DigestSchedulingTest(_TickBase):
         self.assertIn("groupwatch status", text)
         self.store.mark_status(keep, "hold")  # hold 不进抑制计数（口径=counts）
 
+    # ---- F2：持久补发队列（digest_pending 跨 tick、跨午夜） ----
+
+    def _pending_pairs(self):
+        with closing(sqlite3.connect(str(self.home / "groupwatch.db"))) as conn:
+            return conn.execute(
+                "SELECT day, hhmm FROM digest_pending ORDER BY created_ts, "
+                "day, hhmm").fetchall()
+
+    def _pending_states(self):
+        with closing(sqlite3.connect(str(self.home / "groupwatch.db"))) as conn:
+            return conn.execute(
+                "SELECT day, hhmm, state FROM digest_pending ORDER BY "
+                "created_ts, day, hhmm").fetchall()
+
+    def _digest_pushes(self):
+        return [k for _j, k in self.pushed if k == "digest"]
+
+    # ---- F2-round2：交付结果分级（歧义态 hold，零执行态续试） ----
+
+    def test_digest_needs_check_holds_exactly_two_then_silence(self):
+        # 实况（2026-11-26 受控验证）：09:12:40 与 09:13:24 两笔 digest 都是
+        # rc3 NEEDS_CHECK——"非 ok 一律留队重试"把歧义发送每个 tick 重发一遍。
+        # 新语义：每个槽位至多自动尝试一次；两个到期槽位各撞一次（恰 2 笔
+        # digest 推送调用）后双双 held，第三个 attempt 永不发生，digest_fired
+        # 保持空（歧义 ≠ 已发）。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, digest_times=("20:30", "21:00"),
+                                   realtime=False), chat)
+        self.clock[0] = time.mktime(
+            time.strptime(f"{day} 21:01", "%Y-%m-%d %H:%M"))
+        self._seed_intel()
+        self.push_status = "stopped:needs_check"
+        for _ in range(4):
+            watchd.one_tick(deps)
+        self.assertEqual(len(self._digest_pushes()), 2)
+        self.assertEqual(self._pending_states(),
+                         [(day, "20:30", "held"), (day, "21:00", "held")])
+        self.assertEqual(self.store.held_digest_count(), 2)
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        self.assertEqual(self.digest_fired_rows(), [])
+
+    def test_digest_pre_fail_stays_pending_and_keeps_retrying(self):
+        # 对照：pre_fail / lock_busy 类结果**零执行已被证明**（预检在 wxsend
+        # 之前）——留 pending、逐 tick 重试是正确行为，直到 ok 定稿。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        due = time.mktime(time.strptime(f"{day} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, realtime=False), chat)
+        self.clock[0] = due + 60
+        self._seed_intel()
+        self.push_status = "pre_fail"
+        watchd.one_tick(deps)
+        self.assertEqual(self._pending_states(), [(day, "20:30", "pending")])
+        watchd.one_tick(deps)
+        self.assertEqual(self.store.held_digest_count(), 0)
+        self.assertEqual(len(self._digest_pushes()), 2)  # 第二笔照常尝试
+        self.push_status = "stopped:lock_busy"
+        watchd.one_tick(deps)
+        self.assertEqual(self._pending_states(), [(day, "20:30", "pending")])
+        self.push_status = "ok"
+        watchd.one_tick(deps)
+        self.assertEqual(self.digest_fired_rows(), [(day, "20:30")])
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        self.assertEqual(len(self._digest_pushes()), 4)
+
+    def test_held_never_reattempted_until_human_unhold(self):
+        # held 行健康 tick 也不碰；人工按 README SQL 改回 pending 后才重发。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        due = time.mktime(time.strptime(f"{day} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, realtime=False), chat)
+        self.clock[0] = due + 60
+        self._seed_intel()
+        self.push_status = "stopped:needs_check"
+        watchd.one_tick(deps)
+        self.assertEqual(len(self._digest_pushes()), 1)
+        self.push_status = "ok"
+        watchd.one_tick(deps)  # 环境好了也绝不自动重发歧义笔
+        self.assertEqual(len(self._digest_pushes()), 1)
+        self.assertEqual(self.digest_fired_rows(), [])
+        # 裁决路径②"确认没送达且环境已修"：UPDATE 回 pending → 下 tick 重发
+        self.store._conn.execute(
+            "UPDATE digest_pending SET state='pending' WHERE day=? AND hhmm=?",
+            (day, "20:30"))
+        self.store._conn.commit()
+        watchd.one_tick(deps)
+        self.assertEqual(len(self._digest_pushes()), 2)
+        self.assertEqual(self.digest_fired_rows(), [(day, "20:30")])
+        self.assertEqual(self.store.held_digest_count(), 0)
+
+    def test_digest_persists_across_midnight(self):
+        # F2 实况（2026-11-26）：20:30 被闸门挡下 → 旧流程过午夜即永久丢弃。
+        # 新流程：被挡的 day1 槽位留在 digest_pending，day2 首个健康 tick 补发，
+        # digest_fired 记的是 **day1** 槽位、文本仍是 day1 的汇总（不重渲染）。
+        day1 = time.strftime("%Y-%m-%d", time.localtime())
+        due1 = time.mktime(time.strptime(f"{day1} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, realtime=False), chat)
+        self._seed_intel()
+        self.clock[0] = due1 + 60
+        self.push_status = "pre_fail"
+        watchd.one_tick(deps)
+        self.assertEqual([k for _j, k in self.pushed], ["digest"])
+        self.assertEqual(self._pending_pairs(), [(day1, "20:30")])
+        self.assertEqual(self.digest_fired_rows(), [])  # 失败 ≠ 已发
+        # 过午夜 → day2 首个健康 tick：补发的是 day1 排队的那条
+        self.push_status = "ok"
+        self.clock[0] = due1 + 86400 + 60
+        watchd.one_tick(deps)
+        self.assertEqual([k for _j, k in self.pushed], ["digest", "digest"])
+        self.assertEqual(self._pending_pairs(), [])
+        day2 = time.strftime("%Y-%m-%d", time.localtime(self.clock[0]))
+        self.assertNotEqual(day2, day1)  # 确已跨天
+        self.assertEqual(self.digest_fired_rows(), [(day1, "20:30")])
+        text = self.pushed[1][0][0][1]
+        self.assertEqual(text.splitlines()[0], f"{day1} 汇总")  # 不重渲染
+
+    def test_empty_day_does_not_enqueue(self):
+        # 空跑不占位：当日无情报 → 零排队零推送；晚到的情报在后续 tick 入队。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        due = time.mktime(time.strptime(f"{day} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, realtime=False), chat)
+        self.clock[0] = due + 60
+        watchd.one_tick(deps)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(self._pending_pairs(), [])
+        self.assertEqual(self.digest_fired_rows(), [])
+        # 情报晚到 → 下个 tick 入队（此 tick 推送被挡 → 队列行可见）
+        self._seed_intel()
+        self.push_status = "pre_fail"
+        watchd.one_tick(deps)
+        self.assertEqual(self._pending_pairs(), [(day, "20:30")])
+
+    def test_digest_finalized_only_on_ok(self):
+        # "ok 才定稿"：被挡 tick → fired 不加行；成功 tick → 恰加一行；
+        # 之后健康 tick 队列已空 → 不再推不再加行（幂等）。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        due = time.mktime(time.strptime(f"{day} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl, realtime=False), chat)
+        self.clock[0] = due + 60
+        self._seed_intel()
+        self.push_status = "pre_fail"
+        watchd.one_tick(deps)
+        self.assertEqual(self.digest_fired_rows(), [])
+        self.assertEqual(self.store.pending_digest_count(), 1)
+        self.push_status = "ok"
+        watchd.one_tick(deps)
+        self.assertEqual(self.digest_fired_rows(), [(day, "20:30")])
+        self.assertEqual(self.store.pending_digest_count(), 0)
+        watchd.one_tick(deps)  # 已定稿 → 无在队项可发
+        self.assertEqual([k for _j, k in self.pushed], ["digest", "digest"])
+        self.assertEqual(self.digest_fired_rows(), [(day, "20:30")])
+
+    def test_realtime_down_skips_digest_delivery(self):
+        # realtime_down 闸门保留：它只延迟**推送**（GUI），入队（纯 DB）照常。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        due = time.mktime(time.strptime(f"{day} 20:30", "%Y-%m-%d %H:%M"))
+        chat, _ = _chat()
+        deps = self.make_deps(_cfg(self.jsonl), chat)  # realtime=True
+        self.clock[0] = due + 60
+        self._seed_intel()
+        self.push_status = "pre_fail"
+        watchd.one_tick(deps)
+        self.assertEqual([k for _j, k in self.pushed], ["realtime"])
+        self.assertEqual(self._pending_pairs(), [(day, "20:30")])  # 入队已发生
+        watchd.one_tick(deps)
+        # 不重复入队；仍无 digest 推送尝试
+        self.assertEqual(self._pending_pairs(), [(day, "20:30")])
+        self.assertEqual([k for _j, k in self.pushed],
+                         ["realtime", "realtime"])
+        self.push_status = "ok"
+        watchd.one_tick(deps)
+        self.assertEqual([k for _j, k in self.pushed],
+                         ["realtime", "realtime", "realtime", "digest"])
+        self.assertEqual(self.digest_fired_rows(), [(day, "20:30")])
+
     def _seed_intel(self):
         # 直插一条当日情报（ts 用真 time.time，与 day_intels 的 localtime 同天）
         return self.store.insert_intelligence({

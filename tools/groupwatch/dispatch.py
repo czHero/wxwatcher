@@ -24,8 +24,11 @@ wxsend 事实（tools/wechat-send/wxsend.py，只读核对）：
 越过锁阶段、深入 GUI → 归入 needs_check(hold)，不当 crash（crash 会被自动
 重试，超时后恰恰不可信）。
 
-预检点位 `PROBE_POINTS` 为 1440×900 全屏微信标定坐标；enroll（后续任务）据此
-生成 `home/probe_points.json`（`[{"name","x","y","r","g","b","tol"}]`）。逐点判定
+预检点位 `PROBE_POINTS` 为 1440×900 全屏微信标定坐标，恰含六个跨聊天/面板
+状态不变量（chrome 两点 + 左图标栏四钮，F3/F3-round3：聊天内容相关点位随
+会话漂移，纯 chrome 点位会被深色平面窗口巧合穿透——图标栏提供判别力）。
+enroll（后续任务）据此生成 `home/probe_points.json`
+（`[{"name","x","y","r","g","b","tol"}]`）。逐点判定
 口径：逐通道 `abs(cur-cached) <= tol` 全真才算通过（边界含等号）。
 
 `push_max_per_tick` 由调用方以 `store.pending(cfg.limits.push_max_per_tick)`
@@ -44,12 +47,26 @@ from typing import Callable
 
 from PIL import Image
 
-# 1440×900 全屏微信坐标系（已标定）。
+# 1440×900 全屏微信坐标系（已标定）。点位演进（两轮实况裁决）：
+# F3（round 1 根因）：预检跑在 wxsend 打开目标会话**之前**——输入区(700,880)/
+# 发送钮(1391,866) 像素取决于当前会话/草稿/面板可见性，微信停在非聊天页即
+# 误判遮挡，当晚 20:30 digest 被假挡。剔除聊天内容相关点位，保留 chrome。
+# F3-round3（实况 A/B 证伪纯 chrome）：深色平面窗口（GNOME 终端 ≈(48,10,36)）
+# 盖住全屏微信时 标题带 Δ=0、侧栏 Δ≤28——暗色巧合双双命中，09:26 一条汇总
+# 真被投进终端窗口（幸而队列 needs_check→held 兜住，零重复落点）。故补入
+# 微信**左图标栏**四个图标点位（聊天/通讯录/收藏/下栏钮）：图标有字形与
+# 高亮色，平面覆盖色必撞破其中至少一点（实测距离 ≥47~185，远超 tol=28）。
+# 约定注记：聊天钮(95,148) 取的是聊天 tab 激活态的绿色气泡——隐含"推送时刻
+# 微信停在聊天 tab"的运营约定（digest/实时推送均如此），换 tab 会由该点位
+# 报 pre_fail（可见、零执行、自动恢复后重试），不是静默风险。打开目标会话
+# 与按发送钮仍是 wxsend 的职责，post-check/needs_check 为右半屏兜底。
 PROBE_POINTS = (
     {"name": "标题带", "x": 60, "y": 40},
     {"name": "侧栏", "x": 60, "y": 500},
-    {"name": "输入区", "x": 700, "y": 880},
-    {"name": "发送钮", "x": 1391, "y": 866},
+    {"name": "聊天钮", "x": 95, "y": 148},
+    {"name": "通讯录钮", "x": 95, "y": 195},
+    {"name": "收藏钮", "x": 95, "y": 290},
+    {"name": "下栏钮", "x": 95, "y": 430},
 )
 
 
@@ -188,8 +205,11 @@ def _pre_fail(store, kind: str, reason: str) -> str:
     """M5：pre_fail 是状态不是事件——连续被挡只记首笔（遮挡/锁屏时段每
     tick 一行会灌爆 dispatches/journal）；状态真变化后重新记。所有
     pre_fail 出口共用此路（真预检不过 / require_enroll 拒绝盲发）。"""
-    last = store.recent_dispatches(1)
-    if not (last and last[0]["status"] == "pre_fail"):
+    # F1：去重按 kind 隔离——只与**同 kind** 上一笔比。旧实现拿全局最新一笔
+    # （recent_dispatches(1)），另一 kind 的 pre_fail 会把本 kind 首笔吞掉
+    # （2026-11-26 实况：09:49 测试 digest 吞掉 20:30 digest 的唯一痕迹）。
+    last = store.last_dispatch(kind)
+    if not (last and last["status"] == "pre_fail"):
         store.log_dispatch(kind, "pre_fail", reason)
     return "pre_fail"
 
