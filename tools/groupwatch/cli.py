@@ -7,7 +7,8 @@
   错误）。**永不退 1**：意外异常在 `main` 顶层统一转成中文一行 + 退 2。
 - 可测性接缝（模块级属性，测试用 mock.patch.object 替换）：
   `_list_groups_impl(home)`（monitor 群发现）、`_screenshot(png, *, run)`
-  （gnome-screenshot）；其余走被依赖模块的属性（`dispatch.pixel_probe`、
+  （gnome-screenshot）、`svc_probe`（status 健康判定查服务态，默认
+  subprocess.run，测试注入假 runner——永不触真 systemctl）；其余走被依赖模块的属性（`dispatch.pixel_probe`、
   `modelclient.chat`、`watchd.build_deps/acquire_lock/one_tick/run_forever`），
   均以 `模块.属性` 形式调用以便打桩。
 
@@ -40,7 +41,22 @@ _PROBE_SYSONE_QUESTIONS = {
     "ping": {"type": "noul", "instructions": "是否命中",
              "criteria": {"true": "是", "false": "否"}},
 }
-_JSONL_STALE_S = 300  # jsonl mtime 距今超过此秒数 → 疑似监听端停跑
+_JSONL_STALE_S = 300  # jsonl mtime 距今超过此秒数 → "陈旧"（是否报警须结合服务态）
+_MONITOR_UNIT = "wechat-monitor"  # 监听端 systemd user 单元名（round-5 健康判定）
+
+# 健康判定接缝（round-5）：status 用它查监听端服务态，默认就是 subprocess.run
+# （测试用 mock.patch.object(cli, "svc_probe", fake) 注入——**测试永不触 systemctl**）。
+svc_probe = subprocess.run
+
+
+def _monitor_svc_active() -> bool:
+    """监听端 systemd user 服务是否在跑。非零退出/异常/非 'active' 态一律视为未运行。"""
+    try:
+        r = svc_probe(["systemctl", "--user", "is-active", _MONITOR_UNIT],
+                      capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return r.returncode == 0 and (getattr(r, "stdout", "") or "").strip() == "active"
 
 _INIT_CONFIG = {
     "models": {
@@ -244,13 +260,25 @@ def _cmd_status(home, args) -> int:
     print(f"游标: {watchd.CURSOR_KEY} 偏移 {off} / "
           f"{watchd.BAD_LINES_KEY} {bad}")
 
+    # 健康判定（round-5）：以监听端服务 STATE 为准，jsonl 陈旧只在服务没跑时才是
+    # 报警——静默期"没消息可写"不等于"停跑"（live 复核 2026-11-27：poll 30s、
+    # mtime 318s 曾误报）。jsonl 不存在时不查服务态（无从结合，也免扰 systemd）。
     j = Path(cfg.ingest.jsonl)
     try:
         age = time.time() - j.stat().st_mtime
-        if age > _JSONL_STALE_S:
-            print(f"jsonl: {j} 最后更新 {int(age)} 秒前  ⚠ 监听端疑似停跑")
+        stale = age > _JSONL_STALE_S
+        print(f"jsonl: {j} 最后更新 {int(age)} 秒前")
+        if _monitor_svc_active():
+            if stale:
+                print("监听端: 服务在跑，近期无新消息")
+            else:
+                print("监听端: 服务在跑")
         else:
-            print(f"jsonl: {j} 最后更新 {int(age)} 秒前")
+            if stale:
+                print("监听端: 疑似停跑 ⚠ 启动: systemctl --user start "
+                      f"{_MONITOR_UNIT}（或手动拉起 monitor.py）")
+            else:
+                print("监听端: 未在 systemd 下运行（jsonl 尚新，手动跑的请忽略）")
     except OSError:
         print(f"jsonl: {j} 尚不存在（监听端还没产生消息，或路径未配好）")
 
@@ -270,6 +298,30 @@ def _cmd_status(home, args) -> int:
               f"（确认已送达/没送达的两条 SQL 见 README"
               f"「汇总推送的结果分级」段）")
 
+    # F2-round4：今日汇总时隙逐条点名——已发送/排队待发/待人工裁决/到点将发
+    # (当日情报 N 条)/当日暂无情报五态可分辨，杀掉"队列空=不知道是没得发还是
+    # 坏了"的歧义沉默。优先级 fired > held > pending（has_record 覆盖任意在队
+    # 态，前两者摘掉后剩下的必是 pending）；digest 停摆时整块不印（没有安排
+    # 可言，印了反而是谎）。
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if cfg.push.digest_enabled:
+        times = list(cfg.push.digest_times)
+        print(f"今日汇总安排: 时隙 [{', '.join(times)}]")
+        fired = set(st.fired_digests(today))
+        held_slots = {(r["day"], r["hhmm"]) for r in st.held_digests()}
+        n_today = len(st.day_intels(today))
+        for hhmm in times:
+            if hhmm in fired:
+                print(f"  {hhmm} 已发送")
+            elif (today, hhmm) in held_slots:
+                print(f"  {hhmm} 待人工裁决")
+            elif st.has_digest_record(today, hhmm):
+                print(f"  {hhmm} 排队待发")
+            elif n_today:
+                print(f"  {hhmm} 到点将发(当日情报 {n_today} 条)")
+            else:
+                print(f"  {hhmm} 当日暂无情报,到点不会发")
+
     disp = st.recent_dispatches(8)
     print("最近推送（至多 8 条）:")
     if not disp:
@@ -282,7 +334,6 @@ def _cmd_status(home, args) -> int:
     for r in pend:
         print(f"  id={r['id']} 群={r['group']} {r['title']}")
 
-    today = time.strftime("%Y-%m-%d", time.localtime())
     dayrows = st.day_intels(today)
     holds = [r for r in dayrows if r["pushed"] == "hold"]
     supps = [r for r in dayrows if r["pushed"] == "suppressed"]

@@ -226,6 +226,19 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.store.pending_digest_count(), 0)
         self.assertEqual(self._digest_fired_pairs(), [("2026-11-25", "09:12")])
 
+    def test_fired_digests_lists_day_slots_sorted(self):
+        # F2-round4：status 点名"已发送"要用 fired_digests(day)——只回该日
+        # digest_fired 的 hhmm 升序列表；排队未定稿的行不算，别日行不掺。
+        self.assertEqual(self.store.fired_digests("2026-11-27"), [])  # 空表
+        self.store.enqueue_digest("2026-11-27", "20:30", "A", 100)
+        self.assertEqual(self.store.fired_digests("2026-11-27"), [])  # 排队≠已发
+        self.store.resolve_digest("2026-11-27", "20:30")
+        self.store.resolve_digest("2026-11-27", "08:00")  # 从未排队也可定稿
+        self.store.resolve_digest("2026-11-26", "21:00")  # 别日，不得掺入
+        self.assertEqual(self.store.fired_digests("2026-11-27"),
+                         ["08:00", "20:30"])
+        self.assertEqual(self.store.fired_digests("2026-11-26"), ["21:00"])
+
     def test_open_store_alters_pre_round2_schema(self):
         # 实况库（2026-11-26 事故机）建表于 round-1：digest_pending 无 state
         # 列。open_store 必须 ALTER 补列，旧行按 DEFAULT 落到 'pending'

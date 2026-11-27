@@ -8,9 +8,11 @@
 import contextlib
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,9 +38,13 @@ def _run(argv, home):
     return code, buf.getvalue()
 
 
-def _seed_valid_config(home, judge_api=None):
+def _seed_valid_config(home, judge_api=None, digest_enabled=None,
+                       digest_times=None, jsonl=None):
     """写一份能过 load_config 的最小配置（真值版，非占位符）。
-    judge_api="systemone" 时给 judge 角色写 api 键（accept-fix §5）。"""
+    judge_api="systemone" 时给 judge 角色写 api 键（accept-fix §5）；
+    digest_enabled/digest_times 可选覆盖汇总排程（round-4 status 点名用），
+    缺省保持旧种子行为（enabled=False, times=["12:00"]）；
+    jsonl 可选覆盖监听端 jsonl 路径（round-5 健康判定用，缺省为不存在文件）。"""
     home = Path(home)
     judge = {"base_url": "https://x/v1",
              "model": "decision-model-preview",
@@ -51,11 +57,13 @@ def _seed_valid_config(home, judge_api=None):
             "extract": {"base_url": "https://e/v1", "model": "qwen-max",
                         "api_key_file": "extract.key"},
         },
-        "ingest": {"jsonl": str(home / "nope.jsonl"),
+        "ingest": {"jsonl": jsonl or str(home / "nope.jsonl"),
                    "poll_interval_s": 5, "batch_max_msgs": 40,
                    "batch_max_wait_s": 60},
         "push": {"target_roster_key": "filehelper", "realtime": True,
-                 "digest": {"enabled": False, "times": ["12:00"]}},
+                 "digest": {
+                     "enabled": False if digest_enabled is None else digest_enabled,
+                     "times": digest_times or ["12:00"]}},
         "limits": {"max_retries": 3, "push_max_per_tick": 10,
                    "inbox_retention_days": 14},
     }
@@ -278,11 +286,153 @@ class CliTest(unittest.TestCase):
         self.assertIn("待裁决: 2026-11-26 09:12", out)  # 最旧 held 点名
         self.assertIn("README", out)  # 指向裁决 SQL 文档
 
+    def test_status_names_today_digest_slots(self):
+        # F2-round4：今日时隙逐条点名——已发送/排队待发/待人工裁决三种终态
+        # 可分辨（优先级 fired > held > pending），"空队列"不再等于"不知道坏没坏"。
+        _seed_valid_config(self.home, digest_enabled=True,
+                           digest_times=["08:00", "12:00", "20:30"])
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        st = store.open_store(self.home / "groupwatch.db")
+        self.addCleanup(st._conn.close)
+        st.resolve_digest(today, "08:00")  # 定稿=已发送（contract：经 resolve 种子）
+        st.enqueue_digest(today, "12:00", "午间汇总", 100)
+        st.enqueue_digest(today, "20:30", "晚间汇总", 200)
+        st.hold_digest(today, "20:30")
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("今日汇总安排: 时隙 [08:00, 12:00, 20:30]", out)
+        self.assertIn("08:00 已发送", out)
+        self.assertIn("12:00 排队待发", out)
+        self.assertIn("20:30 待人工裁决", out)
+
+    def test_status_today_slot_will_fire_names_intel_count(self):
+        # 无队列无定稿、当日有情报 → 预告"到点将发"并点名条数。
+        _seed_valid_config(self.home, digest_enabled=True,
+                           digest_times=["20:30"])
+        st = store.open_store(self.home / "groupwatch.db")
+        self.addCleanup(st._conn.close)
+        for k in ("k1", "k2"):
+            st.insert_intelligence({
+                "group": "cidA", "item_id": "homework", "title": "作业",
+                "detail": "d", "deadline": "", "action": "a",
+                "source_keys": [k], "raw_json": "{}"})
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("20:30 到点将发(当日情报 2 条)", out)
+        self.assertNotIn("当日暂无情报", out)
+
+    def test_status_today_slot_empty_db_says_no_intel(self):
+        # 空库（一切皆零）必须显式说"当日暂无情报,到点不会发"——
+        # 这正是"没什么可总结"与"坏了"的分界句。
+        _seed_valid_config(self.home, digest_enabled=True,
+                           digest_times=["20:30"])
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("今日汇总安排: 时隙 [20:30]", out)
+        self.assertIn("20:30 当日暂无情报,到点不会发", out)
+        self.assertNotIn("到点将发", out)
+
+    def test_status_digest_schedule_block_absent_when_disabled(self):
+        # digest_enabled=False：没有"安排"可言，整块不印（印了反而撒谎）。
+        _seed_valid_config(self.home)
+        code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertNotIn("今日汇总安排", out)
+
     def test_status_reports_config_error_exit0(self):
         # 无 config.json → load_config 抛 ConfigError，status 只报不崩，退出码 0
         code, out = _run(["status"], self.home)
         self.assertEqual(code, 0)
         self.assertIn("config.json", out)
+
+    # ---- status 健康块：监听端按服务 STATE 判定，不按 jsonl 缺席（round-5）----
+
+    def _fake_svc(self, stdout="", returncode=0, raise_exc=False):
+        """注入 cli.svc_probe 的假 subprocess.run；记录调用命令，绝不触真 systemctl。"""
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if raise_exc:
+                raise FileNotFoundError("systemctl not found")
+            return SimpleNamespace(returncode=returncode, stdout=stdout)
+        return run, calls
+
+    def _jsonl_with_age(self, age_s):
+        """tmp home 里造一个 mtime 距今 age_s 秒的 jsonl，返回路径。"""
+        p = self.home / "messages.jsonl"
+        p.write_text("{}", encoding="utf-8")
+        t = time.time() - age_s
+        os.utime(p, (t, t))
+        return p
+
+    def test_status_health_active_stale_says_quiet_not_broken(self):
+        # active + mtime>300s：静默期是"没消息"，不是"停跑"——不得出现 ⚠/疑似停跑
+        p = self._jsonl_with_age(400)
+        _seed_valid_config(self.home, jsonl=str(p))
+        run, calls = self._fake_svc(stdout="active\n", returncode=0)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("监听端: 服务在跑，近期无新消息", out)
+        self.assertNotIn("疑似停跑", out)
+        self.assertNotIn("⚠", out)
+        self.assertIn("wechat-monitor", " ".join(calls[0]))
+
+    def test_status_health_active_fresh(self):
+        # active + 新鲜：一句话"服务在跑"
+        p = self._jsonl_with_age(10)
+        _seed_valid_config(self.home, jsonl=str(p))
+        run, calls = self._fake_svc(stdout="active\n", returncode=0)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("监听端: 服务在跑", out)
+        self.assertNotIn("近期无新消息", out)
+        self.assertNotIn("疑似停跑", out)
+
+    def test_status_health_not_active_fresh_mentions_manual(self):
+        # 非 active（is-active 退非零、stdout "inactive"）+ jsonl 尚新 → 手动跑的提示
+        p = self._jsonl_with_age(10)
+        _seed_valid_config(self.home, jsonl=str(p))
+        run, calls = self._fake_svc(stdout="inactive\n", returncode=3)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("监听端: 未在 systemd 下运行（jsonl 尚新，手动跑的请忽略）", out)
+        self.assertNotIn("疑似停跑", out)
+
+    def test_status_health_not_active_stale_warns_with_start_hint(self):
+        # 非 active + stale：唯一真报警场景——点名疑似停跑并给启动命令
+        p = self._jsonl_with_age(400)
+        _seed_valid_config(self.home, jsonl=str(p))
+        run, calls = self._fake_svc(stdout="failed\n", returncode=1)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("监听端: 疑似停跑 ⚠ 启动: systemctl --user start "
+                      "wechat-monitor（或手动拉起 monitor.py）", out)
+
+    def test_status_health_probe_exception_counts_as_not_active(self):
+        # 接缝抛异常（systemctl 不存在等）→ 视为非 active（contract 规则 1）
+        p = self._jsonl_with_age(10)
+        _seed_valid_config(self.home, jsonl=str(p))
+        run, calls = self._fake_svc(raise_exc=True)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("监听端: 未在 systemd 下运行（jsonl 尚新，手动跑的请忽略）", out)
+
+    def test_status_health_no_jsonl_never_probes_service(self):
+        # jsonl 不存在 → 旧"尚不存在"一行，且绝不调用 svc_probe（测试环境无 systemd，
+        # 任何真实 systemctl 调用都会从这里漏出去）。
+        _seed_valid_config(self.home)
+        run, calls = self._fake_svc(stdout="active\n", returncode=0)
+        with mock.patch.object(cli, "svc_probe", run):
+            code, out = _run(["status"], self.home)
+        self.assertEqual(code, 0)
+        self.assertIn("尚不存在", out)
+        self.assertEqual(calls, [])
 
     # ---- test-model ----
 

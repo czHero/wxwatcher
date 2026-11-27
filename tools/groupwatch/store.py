@@ -310,6 +310,15 @@ class Store:
             (day, hhmm, day, hhmm)).fetchone()
         return row is not None
 
+    def fired_digests(self, day: str) -> list[str]:
+        """该日已定稿（digest_fired 有行）的槽位 hhmm 升序列表——F2-round4
+        status 逐槽点名"已发送"用。排队未定稿不算；按 day 精确过滤，历史日
+        /其它日的行绝不掺入（跨天补发槽位属其当日，今日点名不背）。"""
+        rows = self._conn.execute(
+            "SELECT hhmm FROM digest_fired WHERE day=? ORDER BY hhmm",
+            (day,)).fetchall()
+        return [r["hhmm"] for r in rows]
+
     def pending_digest_count(self) -> int:
         """待补发条数（state='pending'）。held 行不计——它们有专列计数
         held_digest_count()，status 两路分开显示。"""
